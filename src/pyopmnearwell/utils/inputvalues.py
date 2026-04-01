@@ -188,19 +188,31 @@ def readthesecondpart(lol, dic, index):
     index += 3 + dic["imbnum"] * (dic["satnum"] + dic["perforations"][0])
     dic["thickness"] = []
     dic["nz_perlayer"] = []
-    for i in range(dic["satnum"] + dic["perforations"][0]):  # Rock values
-        row = list((lol[index + i][0].strip()).split())
-        dic["rock"].append(
-            [
-                float(row[1]),
-                float(row[3]),
-                float(row[5]),
-            ]
-        )
-        if i < dic["satnum"]:
-            dic["thickness"].append(float(row[7]))
-            if dic["model"] == "co2eor" or dic["model"] == "co2eormodified":
+
+    # Rock values
+    for i in range(dic["satnum"] + dic["perforations"][0]):
+        row = (lol[index + i][0].strip()).split()
+
+        # Format A (ditt): "id Kxy Kz phi thickness"
+        if len(row) == 5:
+            dic["rock"].append([float(row[1]), float(row[2]), float(row[3])])
+            if i < dic["satnum"]:
+                dic["thickness"].append(float(row[4]))
+
+        # Format B (eldre / annen variant): forventer flere kolonner
+        else:
+            # behold gammel logikk, men med guard så den ikke kræsjer
+            if len(row) < 6:
+                raise ValueError(f"Rock row has too few columns: {row}")
+
+            dic["rock"].append([float(row[1]), float(row[3]), float(row[5])])
+
+            if i < dic["satnum"] and len(row) >= 8:
+                dic["thickness"].append(float(row[7]))
+
+            if i < dic["satnum"] and (dic["model"] in ["co2eor", "co2eormodified"]) and len(row) >= 10:
                 dic["nz_perlayer"].append(int(row[9]))
+
     index += 3 + dic["satnum"] + dic["perforations"][0]
     column = []
     dic["minWBHP_prod"] = []

@@ -223,10 +223,10 @@ def scale_and_prepare_dataset(
     dsfile: str | pathlib.Path,
     feature_names: list[str],
     savepath: str | pathlib.Path,
-    train_split: float = 0.9,
+    train_split: float = 0.8,
     val_split: Optional[float] = 0.1,
-    test_split: Optional[float] = None,
-    shuffle: Literal["first", "last", "false"] = "first",
+    test_split: Optional[float] = 0.1,
+    shuffle: Literal["first", "last", "false"] = "false",
     feature_range: tuple[float, float] = (-1, 1),
     target_range: tuple[float, float] = (-1, 1),
     scale: bool = True,
@@ -395,7 +395,61 @@ def scale_and_prepare_dataset(
     train_ds = ds.take(train_size)
     val_ds = ds.skip(train_size).take(val_size)
     test_ds = ds.skip(train_size).skip(val_size)
+    ################ ENDRET 16.03 #############################################
 
+    
+
+    map_file = pathlib.Path(dsfile) / "row_to_run_map.csv"
+    if map_file.exists():
+        with map_file.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            row_map = list(reader)
+
+        train_rows = row_map[:train_size]
+        val_rows = row_map[train_size : train_size + val_size]
+        test_rows = row_map[train_size + val_size :]
+
+        def write_split_csv(rows, outpath):
+            unique_members = sorted({int(r["member_id"]) for r in rows})
+            with outpath.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["member_id"])
+                for m in unique_members:
+                    writer.writerow([m])
+
+        def write_split_rows_csv(rows, outpath):
+            with outpath.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["row_idx", "member_id", "time_id", "layer_id", "x_id"]
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+        savepath.mkdir(parents=True, exist_ok=True)
+
+        write_split_csv(train_rows, savepath / "train_runs.csv")
+        write_split_csv(val_rows, savepath / "val_runs.csv")
+        write_split_csv(test_rows, savepath / "test_runs.csv")
+
+        write_split_rows_csv(train_rows, savepath / "train_rows.csv")
+        write_split_rows_csv(val_rows, savepath / "val_rows.csv")
+        write_split_rows_csv(test_rows, savepath / "test_rows.csv")
+        
+        
+        train_members = {int(r["member_id"]) for r in train_rows}
+        val_members = {int(r["member_id"]) for r in val_rows}
+        test_members = {int(r["member_id"]) for r in test_rows}
+
+        overlap_train_val = train_members & val_members
+        overlap_train_test = train_members & test_members
+        overlap_val_test = val_members & test_members
+
+        if overlap_train_val or overlap_train_test or overlap_val_test:
+            print("WARNING: Runs overlap between splits!")
+            print("train ∩ val :", sorted(overlap_train_val))
+            print("train ∩ test:", sorted(overlap_train_test))
+            print("val ∩ test  :", sorted(overlap_val_test))
+################ ENDRET 16.03 #############################################
     # Treat the other two shuffle options.
     if shuffle == "last":
         logger.info("Shuffling the dataset (after splitting)")

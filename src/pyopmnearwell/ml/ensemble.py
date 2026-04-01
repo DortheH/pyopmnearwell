@@ -1,8 +1,8 @@
 # pylint: skip-file
-""""Run high-fidelity nearwell simulations in OPM-Flow for an ensemble of varying input
+"""Run high-fidelity nearwell simulations in OPM-Flow for an ensemble of varying input
 arguments.
-
 """
+
 from __future__ import annotations
 
 import copy
@@ -22,6 +22,9 @@ from mako.template import Template
 from resdata import FileMode
 from resdata.resfile import ResdataFile
 from resdata.summary import Summary
+
+import subprocess
+import shlex
 
 from pyopmnearwell.utils.formulas import area_squaredcircle, pyopmnearwell_correction
 from pyopmnearwell.utils.inputvalues import readthefirstpart, readthesecondpart
@@ -254,6 +257,78 @@ def setup_ensemble(
     # Ensure ``ensemble_path`` is a ``Path`` object.
     ensemble_path = pathlib.Path(ensemble_path)
 
+    ############## ENDRET! lagt til at den sletter duplikater før den lagrer mappene##################3
+    # --- DEDUPE START (legg rett etter: ensemble_path = pathlib.Path(ensemble_path)) ---
+    def _apply_mako_schedule_rules(member: dict, injection_time_key="INJECTION_TIME"):
+        total = int(round(float(member[injection_time_key])))
+
+        inj1 = int(round(float(member["INJ1_DAYS"])))
+        shut = int(round(float(member["SHUT_DAYS"])))
+
+        # Samme logikk som i ensemble.mako
+        if inj1 + shut > total - 1:
+            shut = max(0, total - 1 - inj1)
+            if inj1 > total - 1:
+                inj1 = total - 1
+                shut = 0
+
+        inj2 = total - inj1 - shut
+        return inj1, shut, inj2, total
+
+    def _quantize_rate(rate: float, rel_step=0.01):
+        # ~1% log-bins (juster rel_step om du vil være strengere/slakkere)
+        if rate <= 0:
+            return 0
+        log_step = math.log10(1.0 + rel_step)
+        return int(round(math.log10(rate) / log_step))
+
+    def _run_signature(member: dict) -> tuple:
+        inj1, shut, inj2, total = _apply_mako_schedule_rules(member)
+        rate_q = _quantize_rate(float(member["INJECTION_RATE"]), rel_step=0.01)
+        return (inj1, shut, inj2, total, rate_q)
+
+    discarded_csv_path = ensemble_path / "discarded_duplicates.csv"
+
+    seen = {}  # signature -> kept_original_index
+    unique_ensemble = []
+    discarded_rows = []
+
+    for original_idx, m in enumerate(ensemble):
+        sig = _run_signature(m)
+        if sig in seen:
+            discarded_rows.append(
+                {
+                    "discarded_original_idx": original_idx,
+                    "duplicate_of_original_idx": seen[sig],
+                    "signature": repr(sig),
+                    "INJ1_DAYS_raw": m.get("INJ1_DAYS"),
+                    "SHUT_DAYS_raw": m.get("SHUT_DAYS"),
+                    "INJECTION_TIME": m.get("INJECTION_TIME"),
+                    "INJECTION_RATE": m.get("INJECTION_RATE"),
+                }
+            )
+            continue
+
+        seen[sig] = original_idx
+        unique_ensemble.append(m)
+
+    # Erstatt ensemble med den unike lista
+    ensemble = unique_ensemble
+
+    # Skriv CSV hvis vi forkastet noe
+    if discarded_rows:
+        with discarded_csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(discarded_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(discarded_rows)
+
+    logger.info(
+        f"Dedup i setup_ensemble: forkastet {len(discarded_rows)} duplikater. "
+        f"Unike medlemmer: {len(ensemble)}. Logg: {discarded_csv_path}"
+    )
+    # --- DEDUPE END ---
+    #################### ENDRET SLUTT !!!####################################
+
     # Update kwargs with the (future) relative path to the first  first ensemble member
     # from any other ensemble member.
     kwargs.update(
@@ -285,6 +360,7 @@ def setup_ensemble(
                 "fol": pathlib.Path(ensemble_path.name) / f"runfiles_{i}",
             },
         )
+
         dic = readthesecondpart(lol, dic, index)
         dic.update({"runname": f"RUN_{i}"})
         # Always calculate geology, grid, tables, etc. for the first ensemble member.
@@ -312,7 +388,6 @@ def get_flags(
     makofile: str | pathlib.Path,
 ) -> str:
     """Extract OPM Flow run flags from a makofile.
-
 
     Args:
         makofile (str | pathlib.Path): Path to the makofile.
@@ -365,6 +440,11 @@ def run_ensemble(
             - step_size_cell (int): Save data only for every ``step_size_cell`` grid
               cell. Default is 1.
             - flags (str): Flags to run OPM Flow with.
+            - save_intermediate_data (bool): If ``True``, store batch data as
+              ``.npy`` chunks on disk instead of keeping all members in memory.
+            - intermediate_data_dir (str | pathlib.Path): Path to store intermediate
+              ``.npy`` chunks. Defaults to
+              ``ensemble_path / "intermediate_data"``.
 
     Returns:
         dict[str, Any]: _description_
@@ -373,9 +453,20 @@ def run_ensemble(
     # Ensure ``ensemble_path`` is a ``Path`` object.
     ensemble_path = pathlib.Path(ensemble_path)
 
-    data: dict = {
-        keyword: [] for keyword in ecl_keywords + init_keywords + summary_keywords
-    }
+    all_keywords: list[str] = ecl_keywords + init_keywords + summary_keywords
+    data: dict[str, Any] = {keyword: [] for keyword in all_keywords}
+    save_intermediate_data: bool = kwargs.get("save_intermediate_data", False)
+    intermediate_data_dir: pathlib.Path = pathlib.Path(
+        kwargs.get("intermediate_data_dir", ensemble_path / "intermediate_data")
+    )
+
+    if save_intermediate_data:
+        # Create folders for each keyword. Inside each folder, files for each batch will
+        # be created.
+        intermediate_data_dir.mkdir(parents=True, exist_ok=True)
+        for keyword in all_keywords:
+            (intermediate_data_dir / keyword).mkdir(parents=True, exist_ok=True)
+
     num_disregarded_runs: int = 0
 
     # Get **kwargs that determine how many report steps and cells shall be skipped when
@@ -383,25 +474,71 @@ def run_ensemble(
     step_size_time: int = kwargs.get("step_size_time", 1)
     step_size_cell: int = kwargs.get("step_size_cell", 1)
 
-    for i in range(round(runspecs["npoints"] / runspecs["npruns"])):
-        command = " ".join(
-            [
-                f"{flow_path}"
-                + f" {ensemble_path / f'runfiles_{j}' / 'preprocessing' / f'RUN_{j}.DATA'}"
-                + f" --output-dir={ensemble_path / f'results_{j}'}"
-                + f" {kwargs.get('flags', '')} & "
-                for j in range(runspecs["npruns"] * i, runspecs["npruns"] * (i + 1))
-            ]
-        )
-        # TODO: Possibly better to use subprocess?
-        os.system(command + "wait")
-        for j in range(runspecs["npruns"] * i, runspecs["npruns"] * (i + 1)):
+    #####ENDRET! ##############
+    # Finn hvilke runfiles-mapper som faktisk finnes
+    run_dirs = sorted(
+        ensemble_path.glob("runfiles_*"),
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    run_ids = [int(p.name.split("_")[1]) for p in run_dirs]
+    logger.info(f"All run_ids: {run_ids}")
+
+    if not run_ids:
+        raise RuntimeError(f"Ingen runfiles_* funnet i {ensemble_path}")
+
+    logger.info(f"Found {len(run_ids)} runfiles directories: {run_ids[0]}..{run_ids[-1]}")
+
+    batch_size = runspecs["npruns"]
+    flags = shlex.split(kwargs.get("flags", ""))
+
+    for b in range(0, len(run_ids), batch_size):
+        batch = run_ids[b : b + batch_size]
+        logger.info(f"Starting batch: {batch}")
+
+        batch_data: dict[str, list[np.ndarray]] = {
+            keyword: [] for keyword in all_keywords
+        }
+
+        procs = {}
+        for j in batch:
+            data_file = (
+                ensemble_path / f"runfiles_{j}" / "preprocessing" / f"RUN_{j}.DATA"
+            )
+            results_dir = ensemble_path / f"results_{j}"
+            results_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [str(flow_path), str(data_file), f"--output-dir={results_dir}", *flags]
+            procs[j] = subprocess.Popen(cmd)
+
+        for j, proc in procs.items():
+            ret = proc.wait()
+            if ret != 0:
+                logger.info(f"Run {j} failed with return code {ret}")
+
+        for j in batch:
             simulation_finished: bool = True
 
+            run_dir = ensemble_path / f"runfiles_{j}"
+            results_dir = ensemble_path / f"results_{j}"
+
+            if not run_dir.exists():
+                num_disregarded_runs += 1
+                logger.info(f"Disregarded ensemble run {j} (missing run dir {run_dir})")
+                continue
+
+            unrst_path = results_dir / f"RUN_{j}.UNRST"
+            if not unrst_path.exists():
+                num_disregarded_runs += 1
+                logger.info(f"Disregarded ensemble run {j} (missing {unrst_path})")
+                continue
+
             resdata_file: ResdataFile = ResdataFile(
-                str(ensemble_path / f"results_{j}" / f"RUN_{j}.UNRST"),
+                str(unrst_path),
                 flags=FileMode.CLOSE_STREAM,
             )
+
+            #####ENDRET slutt! ##############
+
             # Skip result, if the simulation did not run to the last time step.
             if (
                 num_report_steps is not None
@@ -433,7 +570,7 @@ def run_ensemble(
             # Only append data if the simulation finished.
             if simulation_finished:
                 for keyword in ecl_keywords:
-                    data[keyword].append(member_data[keyword])
+                    batch_data[keyword].append(member_data[keyword])
 
                 # Get additional data from init and summary file.
                 if len(init_keywords) > 0:
@@ -446,7 +583,7 @@ def run_ensemble(
                         # cells.
                         # NOTE: The array has shape ``[1, num_cells]``, hence no axis
                         # needs to be added.
-                        data[keyword].append(
+                        batch_data[keyword].append(
                             np.array(init_file.iget_kw(keyword))[::step_size_cell]
                         )
 
@@ -457,11 +594,12 @@ def run_ensemble(
                         str(ensemble_path / f"results_{j}" / f"RUN_{j}.SMSPEC")
                     )
                     for keyword in summary_keywords:
-                        # Append the data corresponding to the keyword for all chosen report
-                        # steps (not for all time steps). The ``*.SMSPEC`` file does not
-                        # include the zeroth report step. Add a dimension to make the array
-                        # broadcastable to data from the ``*.UNRST`` and ``*.INIT`` files.
-                        data[keyword].append(
+                        # Append the data corresponding to the keyword for all chosen
+                        # report steps (not for all time steps). The ``*.SMSPEC`` file
+                        # does not include the zeroth report step. Add a dimension to make
+                        # the array broadcastable to data from the ``*.UNRST`` and
+                        # ``*.INIT`` files.
+                        batch_data[keyword].append(
                             np.array(
                                 summary_file.get_values(keyword, report_only=True)
                             )[::step_size_time, None]
@@ -479,7 +617,31 @@ def run_ensemble(
             if not keep_result_files and j > 0:
                 shutil.rmtree(ensemble_path / f"results_{j}")
                 shutil.rmtree(ensemble_path / f"runfiles_{j}")
+
+        # Store batch data to file or append to dictionary.
+        if save_intermediate_data:
+            for keyword, values in batch_data.items():
+                if len(values) > 0:
+                    np.save(
+                        intermediate_data_dir
+                        / keyword
+                        / f"chunk_{b // batch_size:06d}.npy",
+                        np.array(values),
+                    )
+        else:
+            for keyword, values in batch_data.items():
+                data[keyword].extend(values)
+
         logger.info(f"Disregarded {num_disregarded_runs} of {runspecs['npoints']} runs")
+
+    # Add metadata for intermediate data.
+    if save_intermediate_data:
+        data = {
+            "__saved_chunks_dir__": str(intermediate_data_dir),
+            "__saved_chunks__": True,
+        }
+    else:
+        data["__saved_chunks__"] = False
 
     return data
 
@@ -506,7 +668,6 @@ def calculate_radii(
             with equal solution. Defaults to False.
         angle (float, optional): Angle between both sides of the triangle grid. Defaults
             to ``math.pi/3``.
-
 
     Returns:
         np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]: If return_outer_inner is
@@ -550,7 +711,6 @@ def calculate_WI(
 ) -> tuple[np.ndarray, list[int]]:
     r"""Calculate the well index (WI) for a given dataset.
 
-
     The well index (WI) is calculated using the following formula:
     .. math::
         WI = \frac{q}{{p_w - p_{gb}}}
@@ -568,7 +728,6 @@ def calculate_WI(
         injection_rates (float | np.ndarray): Injection rate. If an ``np.ndarray``, it
             must have shape broadcastable to ``pressures.shape``.
 
-
     Returns:
         WI_array (numpy.ndarray): ``shape=(...,num_x_cells - 1)``
             An array of well index values for each data point in the dataset.
@@ -580,7 +739,6 @@ def calculate_WI(
         ValueError: If no data is found for the 'pressure' keyword in the dataset.
 
     """
-
     # Calculate WI for each ensemble member.
     WI_values: list[np.ndarray] = []
     failed_indices: list[int] = []
@@ -644,10 +802,27 @@ def extract_features(
     if keyword_scalings is None:
         keyword_scalings = {}
     features: list[np.ndarray] = []
+
+    save_chunks_on_disk: bool = data["__saved_chunks__"]
+    saved_chunks_dir = pathlib.Path(data.get("__saved_chunks_dir__", ""))
+
     for keyword in keywords:
-        feature: np.ndarray = np.array(
-            data[keyword]
-        )  # ``shape=(ensemble_size, num_report_steps, num_cells)``
+        if save_chunks_on_disk:
+            # Load batched data and concatenate into a full array.
+            chunk_paths: list[pathlib.Path] = sorted(
+                (saved_chunks_dir / keyword).glob("chunk_*.npy")
+            )
+            if len(chunk_paths) == 0:
+                raise ValueError(f"No saved chunks found for keyword '{keyword}'.")
+            feature: np.ndarray = np.concatenate(
+                [np.load(chunk_path) for chunk_path in chunk_paths]
+            )  # ``shape=(ensemble_size, num_report_steps, num_cells)``
+        else:
+            # Load array at once.
+            feature = np.array(
+                data[keyword]
+            )  # ``shape=(ensemble_size, num_report_steps, num_cells)``
+
         if keyword == "TEMPERATURE":
             feature += keyword_scalings.get(keyword, 0.0)
         else:
@@ -656,7 +831,9 @@ def extract_features(
 
     # Broadcast all features to the same shape
     broadcasted_shape = np.broadcast_shapes(*[feature.shape for feature in features])
-    features = [np.broadcast_to(feature, broadcasted_shape) for feature in features]
+    features = [
+        np.broadcast_to(feature, shape=broadcasted_shape) for feature in features
+    ]
 
     return np.stack(
         features, axis=-1
@@ -713,9 +890,12 @@ def integrate_fine_scale_value(
     # case. This can be removed, once the typing in ``formulas.py`` is more strict.
     # For some reason Pylance thinks that ``block_sidelengths`` is ``int``. Ignore this.
     for block_sidelength in block_sidelengths:  # type: ignore
-        cell_areas: np.ndarray = area_squaredcircle(  # type: ignore
-            radii[1::], block_sidelength
-        ) - area_squaredcircle(radii[:-1:], block_sidelength)
+        cell_areas: np.ndarray = (
+            area_squaredcircle(  # type: ignore
+                radii[1::], block_sidelength
+            )
+            - area_squaredcircle(radii[:-1:], block_sidelength)
+        )
         integrated_values_lst.append(np.sum(radial_values * cell_areas, axis=axis))
     return np.stack(integrated_values_lst, axis=axis)
 
