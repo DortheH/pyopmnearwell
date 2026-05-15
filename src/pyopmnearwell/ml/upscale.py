@@ -286,6 +286,7 @@ class BaseUpscaler(ABC):
         assert feature.shape == self.single_feature_shape
         return feature
 
+    
     def get_analytical_PI(  # pylint: disable=invalid-name
         self: Upscaler,
         permeabilities: np.ndarray,
